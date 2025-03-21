@@ -803,6 +803,8 @@ source /etc/profile.d/kubeadm_completion.sh
 
 ### kubeadm初始化
 
+![image-20250321104514888](pic/image-20250321104514888.png)
+
 在master1节点上执行（只在一个master节点上执行）
 
 ```shell
@@ -973,5 +975,301 @@ kubectl scale deployment/pod-test --replicas=3
 kubectl get svc -l app=pod-test
 
 kubectl get pod   -o wide  | grep pod-test
+
+#查看每个节点信息
+kubectl describe  node master.l00n9.icu
+kubectl describe  node node1.l00n9.icu
+
+kubectl get componentstatuses
+kubectl get cs
+
+kubectl get pod -o wide
+```
+
+## 基于Kubeadm 和 Containerd 部署 Kubernetes 高 可用集群
+
+初始化环境**同上**
+
+haproxy与keepalived 高可用的反向代理**同上**
+
+### 内核优化
+
+如果是安装 Docker 会自动配置以下的内核参数，而无需手动实现
+
+但是如果安装Contanerd，还需手动配置
+
+```shell
+#方法1: 安装docker,自动修改内核参数,并自动安装containerd
+apt -y install docker.io
+
+#方法2：
+modprobe overlay
+modprobe br_netfilter
+
+#开机加载
+cat <<EOF | tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+#设置所需的 sysctl 参数，参数在重新启动后保持不变
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables   = 1
+net.bridge.bridge-nf-call-ip6tables  = 1
+net.ipv4.ip_forward                  = 1
+EOF
+
+# 会依次载入一系列配置文件，包含 /etc/sysctl.conf 和 /etc/sysctl.d/*.conf 等多个路径下的配置文件，更全面。
+sysctl --system
+
+# sysctl -p 载入 默认配置文件 /etc/sysctl.conf 中的内核参数。
+```
+
+### 所有主机安装 Containerd
+
+#### 包安装 Containerd
+
+```shell
+apt -y install containerd
+
+systemctl status containerd
+
+containerd --version
+```
+
+配置containerd
+
+```shell
+mkdir /etc/containerd/
+containerd config default > /etc/containerd/config.toml
+
+#将 sandbox_image 镜像源设置为阿里云google_containers镜像源（国内网络需要）
+grep sandbox_image  /etc/containerd/config.toml
+sed -i "s#registry.k8s.io/pause:3.8#registry.aliyuncs.com/google_containers/pause:3.10#g" /etc/containerd/config.toml
+
+#配置containerd cgroup 驱动程序systemd
+# ubuntu22.04较新内核必须修改,ubuntu20.04更旧的内核版本可不做修改
+grep SystemdCgroup /etc/containerd/config.toml
+sed -i 's#SystemdCgroup = false#SystemdCgroup = true#g' /etc/containerd/config.toml
+```
+
+```toml
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors] #在此行下面添加以下内容
+  
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+    endpoint = ["https://registry.aliyuncs.com"]
+    
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."harbor.l00n9.icu"]
+    endpoint = ["http://harbor.l00n9.icu"]
+  
+    [plugins."io.containerd.grpc.v1.cri".registry.configs."harbor.l00n9.icu".tls]
+      insecure_skip_verify = true
+  
+    [plugins."io.containerd.grpc.v1.cri".registry.configs."harbor.l00n9.icu".auth]
+       username = "admin"
+       password = "123456"
+```
+
+
+
+#### 二进制安装 Containerd
+
+Containerd 有两种二进制安装包:
+
+*   containerd-xxx ：不包含runC，需要单独安装runC
+*   cri-containerd-cni-xxx：包含runc和kubernetes里的所需要的相关文件
+
+[containerd/containerd: An open and reliable container runtime](https://github.com/containerd/containerd)
+
+```shell
+tar xf cri-containerd-cni-1.6.8-linux-amd64.tar.gz  -C /
+
+#如果是不包含runc的,还需要单独下载runc即可
+tar xf containerd-1.6.8-linux-amd64.tar.gz -C /
+
+wget https://github.com/opencontainers/runc/releases/download/v1.1.4/runc.amd64
+mv runc.amd64 /usr/bin/runc
+chmod +x /usr/bin/runc
+
+#参考包安装的service手动创建service文件
+vim /lib/systemd/system/containerd.service
+```
+
+配置 Containerd
+
+```shell
+mkdir /etc/containerd/
+containerd config default > /etc/containerd/config.toml
+
+#将 sandbox_image 镜像源设置为阿里云google_containers镜像源（国内网络需要）
+grep sandbox_image  /etc/containerd/config.toml
+sed -i "s#registry.k8s.io/pause:3.8#registry.aliyuncs.com/google_containers/pause:3.10#g" /etc/containerd/config.toml
+
+#配置containerd cgroup 驱动程序systemd
+# ubuntu22.04较新内核必须修改,ubuntu20.04更旧的内核版本可不做修改
+grep SystemdCgroup /etc/containerd/config.toml
+sed -i 's#SystemdCgroup = false#SystemdCgroup = true#g' /etc/containerd/config.toml
+```
+
+安装 CNI 插件工具
+
+虽然 cri-containerd-cni-1.6.8-linux-amd64.tar.gz 包含了cni，但是无法和kubernetes 兼容
+
+```shell
+wget https://github.com/containernetworking/plugins/releases/download/v1.1.1/cni plugins-linux-amd64-v1.1.1.tgz
+
+#覆盖原有的文件
+tar xf cni-plugins-linux-amd64-v1.1.1.tgz  -C /opt/cni/bin/
+```
+
+### 所有主机安装 kubeadm、kubelet 和 kubectl
+
+同上
+
+### 在第一个 master 节点初始化 Kubernetes 集群
+
+![image-20250321104459420](pic/image-20250321104459420.png)
+
+同上
+
+但不需要加`--cri-socket`参数
+
+### 其他节点添加
+
+同上
+
+### Containerd 客户端工具
+
+## Kubeasz 利用 Ansible 部署二进制 Kubernetes 高可 用集群
+
+所有组件都已二进制安装，以服务的方式运行
+
+[easzlab/kubeasz: 使用Ansible脚本安装K8S集群，介绍组件交互原理，方便直接，不受国内网络环境影响](https://github.com/easzlab/kubeasz)
+
+![image-20250321115536558](pic/image-20250321115536558.png)
+
+| 角色       | 数量 | 描述                                                    |
+| ---------- | ---- | ------------------------------------------------------- |
+| 部署节点   | 1    | 运行ansible/ezctl命令，一般复用第一个master节点         |
+| etcd节点   | 3    | 注意etcd集群需要1,3,5,...奇数个节点，一般复用master节点 |
+| master节点 | 2    | 高可用集群至少2个master节点                             |
+| node节点   | n    | 运行应用负载的节点，可根据需要提升机器配置/增加节点数   |
+
+### ALL in ONE 部署
+
+
+
+### 高可用分布式集群部署案例
+
+#### 从部署主机到其它主机的基于ssh-key验证
+
+```
+devops
+ssh-keygen
+ssh-copy-id 10.0.0.101
+...
+ssh-copy-id 10.0.0.106
+```
+
+#### 下载工具脚本ezdown
+
+```shell
+wget https://github.com/easzlab/kubeasz/releases/download/3.6.5/ezdown
+
+chmod +x ./ezdown
+```
+
+#### 下载kubeasz代码、二进制、默认容器镜像
+
+```shell
+#下载kubeasz代码、二进制、默认下载容器镜像到/etc/kubeasz目录并同时安装Docker，（更多关于ezdown的参数，运行./ezdown 查看）
+./ezdown -D
+
+ls /etc/kubeasz/
+
+docker ps
+
+docker images
+```
+
+#### 准备集群所需的配置环境信息
+
+```shell
+#容器化运行kubeasz，用于安装k8s集群工具
+./ezdown -S
+
+docker ps
+
+#自动生成别名
+tail -n1 .bashrc
+alias dk='docker exec -it kubeasz'  # generated by kubeasz
+source .bashrc
+
+#创建集群的初始的配置信息,指定集群名称k8s-mycluster-01
+dk ezctl new k8s-mycluster-01
+# 或
+docker exec -it kubeasz ezctl new k8s-mycluster-01
+
+#生成的集群相关配置文件
+tree /etc/kubeasz/clusters/
+
+#按规划修改配置
+vim /etc/kubeasz/clusters/k8s-mycluster-01/hosts
+[etcd]
+10.0.0.101
+10.0.0.102
+10.0.0.103
+
+[kube_master]
+10.0.0.101 k8s_nodename='master-01'
+10.0.0.102 k8s_nodename='master-02'
+10.0.0.103 k8s_nodename='master-03'
+
+[kube_node]
+10.0.0.104 k8s_nodename='worker-01'        
+10.0.0.105 k8s_nodename='worker-02'
+10.0.0.106 k8s_nodename='worker-03'
+
+#根据需要修改Service网络配置，默认为10.68.0.0/16，修改此处
+SERVICE_CIDR="10.96.0.0/12"   
+
+#根据需要修改Pod网络配置,默认为172.20.0.0/16 ，修改此处
+CLUSTER_CIDR="10.244.0.0/16"
+
+#修改K8S_VER等,比如:k8s版本,证书有效期,内部Harbor,需要签发证书的IP,节点最大Pod数等(可选)
+#默认不做修改
+vim /etc/kubeasz/clusters/k8s-mycluster-01/config.yml
+
+#查看ansible的playbook
+ls /etc/kubeasz/playbooks/
+```
+
+#### 创建集群
+
+```shell
+dk ezctl help setup
+
+#方法1:一键安装
+dk ezctl setup k8s-mycluster-01  all
+
+#方法2:分步安装，具体使用 dk ezctl help setup 查看分步安装帮助信息
+dk ezctl setup k8s-mycluster-01 01
+dk ezctl setup k8s-mycluster-01 02
+...
+dk ezctl setup k8s-mycluster-01 07
+
+#hosts文件自动被修改
+cat /etc/hosts
+
+#生效配置
+source  .bashrc
+```
+
+#### 验证集群
+
+```shell
+kubectl get nodes
+
+kubectl get pod -A
 ```
 
