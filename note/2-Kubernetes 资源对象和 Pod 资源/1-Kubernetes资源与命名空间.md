@@ -549,5 +549,3 @@ kubectl delete namespaces demo
 | kubectl delete all -n           | 删除指定名称空间内的所有资源           |
 | kubectl delete all --all        | 删除所有名称空间中的所有资源           |
 
-# Pod 资源
-
