@@ -712,3 +712,819 @@ kubectl scale  [--current-replicas=<当前副本数>] --replicas=<新副本数> 
 kubectl scale --replicas=<新副本数> -f deploy_name.yaml
 ```
 
+## Deployment动态更新回滚
+
+### 命令式更新和回滚
+
+```shell
+# 更新命令1
+kubectl set SUBCOMMAND [options] 资源类型 资源名称
+SUBCOMMAND：子命令，常用的子命令就是image
+# 参数详解
+--record=true       # 更改时，会将信息增加到历史记录中
+# 1.32.0 后 将被遗弃
+
+#更新命令2：（用的很少）
+kubectl patch (-f FILENAME | TYPE NAME) -p PATCH [options]
+#参数详解：
+--patch='' #设定对象属性内容
+
+#回滚命令：
+kubectl rollout SUBCOMMAND [options] 资源类型 资源名称
+
+SUBCOMMAND 子命令：
+history         #显示 rollout 历史,默认只保留最近的10个版本
+pause           #标记resource为中止状态，配合resume可实现灰度发布，pause目前仅支持deployment,可配合kubectl set实现批量更新
+restart         #重启一个 resource
+resume          #继续一个停止的 resource
+status          #显示 rollout 的状态
+undo            #撤销上一次的 rollout
+--revision=n    #查看指定版本的详细信息
+--to-revision=0 #rollback至指定版本,默认为0,表示前一个版本
+```
+
+案例
+
+```shell
+kubectl create deployment nginx --image xxx/nginx:1.18.0
+
+kubectl set image deployment nginx nginx='xxx/nginx:1.20.0' --record=true
+
+# 查看历史kubectl rollout history
+kubectl rollout history deployment nginx
+
+# 撤销/回退上次的更改：注意：只能回退一次
+kubectl rollout undo deployment nginx
+
+# 回退到指定版本
+kubectl rollout undo --to-revision=2 deployment nginx
+```
+
+### 命令式批量更新(改动)
+
+默认只更改一次就会触发重新生成新Pod可能会影响业务的稳定,可以将多次批量更新合并为只触发一次 重新创建Pod,从而保证业务的稳定
+
+```shell
+# 暂停更新
+kubectl rollout pause deployment pod-test
+
+# 第一次更改
+kubectl set image deployment pod-test pod-test=registry.cn-beijing.aliyuncs.com/wangxiaochun/pod-test:v0.2 --record
+
+# 第二次更改
+kubectl set resources deployment nginx --limits=cpu=200m,memory=128Mi --requests=cpu=100m,memory=64Mi
+
+
+# 恢复批量更新
+kubectl rollout resume deployment nginx
+```
+
+### 基于声明清单文件实现升级和降级
+
+```yaml
+vim controller-deployment-test.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deployment-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rs-test
+  template:
+    metadata:
+      labels:
+        app: rs-test
+    spec:
+      containers:
+      - name: pod-test
+        image: harbor.l00n9.icu/public/pod-test:v0.2 # 直接改版本
+```
+
+## Deployment滚动更新策略
+
+Deployment 控制器支持两种更新策略
+
+*   **重建式更新 recreate**
+    -   当使用Recreate策略时，Deployment会直接**删除全部的旧的Pod**，然后创建新的Pod。
+    -   这意味着在部署新版本时，整个应用会**停止服务一段时间**，直到所有旧的Pod都被删除并且新的 Pod被创建并运行起来。
+    -   这可能会导致一段时间内的服务中断，因为旧版本的Pod被直接替换掉了。
+    -   **此方式可以防止端口冲突**
+*   **滚动式更新 rolling updates**
+    -   此为默认策略
+    -   RollingUpdate策略允许在部署新版本时逐步更新Pod。
+    -   它会先创建新版本的Pod，然后逐步替换旧版本的Pod，直到所有Pod都已经更新为新版本。
+    -   这种方式可以确保应用**一直处于可用状态**，因为在整个更新过程中，至少有一部分Pod一直在运行。
+    -   **逐批次更新Pod的方式，支持按百分比或具体的数量定义批次规模**
+    -   触发条件:
+        -   **podTemplate的hash码**变动，即仅podTemplate的配置变动才会导致hash码改变
+        -   replicas和selector的变更不会导致podTemplate的hash变动
+
+**存在的问题**:必须以Pod为最小单位来调整规模比例，而无法实现流量路由比例的控制，
+
+比如: 共3个Pod 实现20%流量比例要实现流量路由比例的控制，就需要使用更高级的工具比如: Ingress 才能实现
+
+**属性解析**
+
+```shell
+kubectl explain deployment.spec.strategy
+
+type <string> #主要有两种类型："Recreate"、"RollingUpdate-默认"
+Recreate            #重建,先删除旧Pod,再创建新Pod,比如可以防止端口冲突
+
+kubectl explain deployment.spec.strategy.rollingUpdate
+rollingUpdate       <Object>
+ maxSurge   <string>#更新时允许超过期望值的最大Pod数量或百分比,默认为25%,如果为0,表示先减,再加，此时maxUnavaible不能为0
+ maxUnavailabel <string> #更新时允许最大多少个或百分比的Pod不可用,默认为25%,如果为0,表示先加后减，此时maxSurge不能为0
+#如果maxSurge为正整数, maxUnavailabel为0,表示先添加新版本的Pod,再删除旧版本的Pod，即先加再减
+#如果maxSurge为0, maxUnavaiLabel为正整数,表示先删除旧版本的Pod,再添加新版本的Pod，即先减再加
+#如果maxSurge为100%，maxUnavaiLabel为100%，实现蓝绿发布，注意：资源要足够
+```
+
+| 属性            | 解析                                                         |
+| --------------- | ------------------------------------------------------------ |
+| minReadySeconds | Kubernetes 会在 Pod 进入 Ready 状态后，再等待这个设置的秒数，才将其计入 `availableReplicas` |
+| maxSurge        | 升级过程中Pod最多可比预期值多出的Pod数量，其值可以是0或正整数,或 者相对预期值的百分比 默认是25% 例如：maxSurage=1，replicas=5,则表示Kubernetes会先启动1一个新的 Pod后才删掉一个旧的POD，整个升级过程中最多会有5+1个Pod。 |
+| maxUnavailabel  | 升级过程中最多有多少个Pod处于无法提供服务的状态 默认是25% **当maxSurge为0时，该值也不能为0** 例如：maxUnavaible=1，则表示Kubernetes整个升级过程中最多会有1个 POD处于无法服务的状态。 |
+
+![image-20250326093259794](pic/image-20250326093259794.png)
+
+![image-20250326093325519](pic/image-20250326093325519.png)
+
+### 滚动更新
+
+```yaml
+vim controller-deployment-rollupdate.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deployment-rolling-update
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: pod-test
+  template:
+    metadata:
+      labels:
+        app: pod-test
+    spec:
+      containers:
+      - name: pod-rolling-update
+        image: harbor.l00n9.icu/public/pod-test:v0.1
+    minReadySeconds: 5
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 1
+        maxUnavailable: 1
+
+# 属性解析
+minReadySeconds: 5 
+maxSurge: 1 #定义了在更新期间允许超过期望数量的 Pod 实例,此处表示允许超过期望数量的一个额外的 Pod 实例。
+maxUnavaiLabel: 1 #定义了在更新期间允许不可用的最大 Pod 数量。此处表示在更新期间允许最多一个 Pod 不可用。
+```
+
+
+
+### 金丝雀发布
+
+```yaml
+vim controller-deployment-rollupdate-canary.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deployment-rolling-update-canary
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: pod-test
+  template:
+    metadata:
+      labels:
+        app: pod-test
+    spec:
+      containers:
+      - name: pod-rolling-update-canary
+        image: harbor.l00n9.icu/public/pod-test:v0.1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1         # 先加后减
+      maxUnavailable: 0
+      
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: pod-test
+  name: pod-test
+spec:
+  ports:
+  - name: "80"
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: pod-test
+  type: ClusterIP
+```
+
+升级版本
+
+```yaml
+vim controller-deployment-rollupdate-canary.yaml
+    spec:
+      containers:
+      - name: pod-rolling-update-canary
+        image: harbor.l00n9.icu/public/pod-test:v0.2  # 版本改动
+```
+
+金丝雀发布
+
+```shell
+kubectl apply -f controller-deployment-rollupdate-canary.yaml && kubectl rollout pause deployment deployment-rolling-update-canary
+
+kubectl get pod
+NAME                                                READY   STATUS    RESTARTS   AGE
+deployment-rolling-update-canary-784c9f454b-65c6j   1/1     Running   0          19s  # v0.2
+deployment-rolling-update-canary-8494b68b65-brsk7   1/1     Running   0          4m19s
+deployment-rolling-update-canary-8494b68b65-mfvmn   1/1     Running   0          4m19s
+deployment-rolling-update-canary-8494b68b65-v92mb   1/1     Running   0          4m19s
+```
+
+确信没问题之后，继续完成一部分更新
+
+```shell
+kubectl rollout resume deployment deployment-rolling-update-canary && kubectl rollout pause deployment deployment-rolling-update-canary
+
+kubectl get pod
+NAME                                                READY   STATUS    RESTARTS   AGE
+deployment-rolling-update-canary-784c9f454b-65c6j   1/1     Running   0          2m18s # v0.2
+deployment-rolling-update-canary-784c9f454b-dcxgf   1/1     Running   0          34s   # v0.2
+deployment-rolling-update-canary-8494b68b65-brsk7   1/1     Running   0          6m18s
+deployment-rolling-update-canary-8494b68b65-mfvmn   1/1     Running   0          6m18s
+```
+
+全部更新
+
+```shell
+kubectl rollout resume deployment deployment-rolling-update-canary
+```
+
+
+
+### 蓝绿发布
+
+```yaml
+vim controller-deployment-rollupdate-bluegreen.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deployment-rolling-update-bluegreen
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: pod-test
+  template:
+    metadata:
+      labels:
+        app: pod-test
+    spec:
+      containers:
+      - name: pod-rolling-update-bluegreen
+        image: harbor.l00n9.icu/public/pod-test:v0.1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 100%
+      maxUnavailable: 100%
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: pod-test
+  name: pod-test
+spec:
+  ports:
+  - name: "80"
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: pod-test
+  type: ClusterIP
+```
+
+更新
+
+```shell
+vim controller-deployment-rollupdate-bluegreen.yaml
+    spec:
+      containers:
+      - name: pod-rolling-update-bluegreen
+        image: harbor.l00n9.icu/public/pod-test:v0.2
+        
+kubectl apply -f controller-deployment-rollupdate-bluegreen.yaml 
+```
+
+回退
+
+```shell
+kubectl rollout undo deployment deployment-rolling-update-bluegreen 
+```
+
+# DaemonSet
+
+有些情况下，**需要在所有节点都运行一个Pod**，因为Node数量会变化，所以指定Pod的副本数就不合适 了
+
+DaemonSet能够让所有（或者特定）的节点"精确的"运行同一个pod
+
+当节点加入到kubernetes集群中，Pod会被DaemonSet 控制器调度到该节点上运行
+
+当节点从Kubrenetes集群中被移除，被DaemonSet调度的pod也会被移除
+
+如果删除DaemonSet，所有跟这个DaemonSet相关的pods都会被删除
+
+在某种程度上，DaemonSet承担了RS的部分功能，它也能保证相关pods持续运行
+
+**DaemonSet 的一些典型用法**
+
+-   在每个节点上运行集群守护进程
+-   在每个节点上运行日志收集守护进程
+-   在每个节点上运行监控守护进程
+
+**常用于后台支撑服务**
+
+-   Kubernetes集群的系统级应用: kube-proxy,flannel,calico
+-   集群存储守护进程，如：ceph，glusterd
+-   日志收集服务，如：fluentd，logstash
+-   监控服务，如：Prometheus，collectd
+-   暴露服务: 如: Ingress nginx
+
+![image-20250326192604218](pic/image-20250326192604218.png)
+
+## DaemonSet属性解析
+
+```shell
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: <string>
+  namespace: <string>
+spec:
+  minReadySeconds: <integer>
+  selector: <object>
+  template: <object>
+  revisionHistoryLimit: <integer>
+  updateStrategy: <object>          # 滚动更新策略
+    type: <string>                  # 滚动更新类型，OnDelete(删除时更新，手动触发)和RollingUpdate(默认值，滚动更新)
+    rollingUpdate: <object>
+      maxSurge
+      maxUnavailable: <string>
+```
+
+示例
+
+```yaml
+#https://kubernetes.io/zh-cn/docs/concepts/workloads/controllers/daemonset/
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd-elasticsearch
+  namespace: kube-system
+  labels:
+    k8s-app: fluentd-logging
+spec:
+  selector:
+    matchLabels:
+      name: fluentd-elasticsearch
+  template:
+    metadata:
+      labels:
+        name: fluentd-elasticsearch
+    spec:
+      tolerations:
+      # 这些容忍度设置是为了让该守护进程集在控制平面节点上运行
+      # 如果你不希望自己的控制平面节点运行Pod，可以删除它们
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: fluentd-elasticsearch
+        image: quay.io/fluentd_elasticsearch/fluentd:v2.5.2
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+```
+
+## DaemonSet案例
+
+```yaml
+vim controller-daemonset-test.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: controller-daemonset-test
+spec:
+  selector:
+    matchLabels:
+      app: pod-test
+  template:
+    metadata:
+      labels:
+        app: pod-test
+    spec:
+      # hostNetwork: true #使用宿主机的网络和端口,可以通过宿主机直接访问Pod,性能好,但要防止端口冲突
+      # hostPID: true #直接使用宿主机的PID
+      containers:
+      - name: pod-test
+        image: harbor.l00n9.icu/public/pod-test:v0.1
+
+kubectl get ds
+NAME                        DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+controller-daemonset-test   3         3         3       3            3           <none>          23s
+
+kubectl get pod -o wide
+NAME                              READY   STATUS    RESTARTS   AGE   IP            NODE              NOMINATED NODE   READINESS GATES
+controller-daemonset-test-98z82   1/1     Running   0          17s   10.244.1.34   node1.l00n9.icu   <none>           <none>
+controller-daemonset-test-9jmbj   1/1     Running   0          17s   10.244.2.44   node2.l00n9.icu   <none>           <none>
+controller-daemonset-test-k87d2   1/1     Running   0          17s   10.244.3.23   node3.l00n9.icu   <none>           <none>
+```
+
+daemonset对象也支持滚动更新
+
+```shell
+kubectl set image daemonsets controller-daemonset-test pod-test='wangxiaochun/pod-test:v0.2' --record=true kubectl rollout status daemonset controller-daemonset-test
+
+# 注意：daemonset对象不支持pause动作
+```
+
+## 在所有节点上部署监控软件node-exporter采集指标数据
+
+```yaml
+# cat controller-daemonset-prometheus-node-exporter.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: daemonset-demo
+  namespace: default
+  labels:
+    app: prometheus
+    component: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app: prometheus
+      component: node-exporter
+  template:
+    metadata:
+      name: prometheus-node-exporter
+      labels:
+        app: prometheus
+        component: node-exporter
+    spec:
+      #tolerations:
+      #- key: node-role.kubernetes.io/control-plane
+      #  operator: Exists
+      #  effect: NoSchedule
+      #- key: node-role.kubernetes.io/master
+      #  operator: Exists
+      #  effect: NoSchedule
+      containers:
+      - image: harbor.l00n9.icu/prom/node-exporter:v1.2.2
+        name: prometheus-node-exporter
+        ports:
+        - name: prom-node-exp
+          containerPort: 9100
+          #hostPort: 9100
+        livenessProbe:
+          tcpSocket:
+            port: prom-node-exp
+          initialDelaySeconds: 3
+        readinessProbe:
+          httpGet:
+            path: '/metrics'
+            port: prom-node-exp
+            scheme: HTTP
+          initialDelaySeconds: 5
+      hostNetwork: true
+      hostPID: true
+```
+
+## 指定标签的每个主机上运行一个Pod
+
+```yaml
+cat controller-daemonset-label-test.yaml 
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: controller-daemonset-label-test
+spec:
+  selector:
+    matchLabels:
+      app: pod-test
+  template:
+    metadata:
+      labels:
+        app: pod-test
+    spec:
+      nodeSelector:      # 使用节点标签选择器
+        ds: "true"       #指定条件
+      containers:
+      - name: pod-test
+        image: registry.cn-beijing.aliyuncs.com/wangxiaochun/pod-test:v0.1
+```
+
+# Job
+
+## Job工作机制
+
+在日常的工作中，经常会遇到临时执行一个任务，但是这个任务必须在某个时间点执行才可以
+
+前面的Deployment和DaemonSet主要负责编排始终**持续运行的守护进程类的应用**，并不适合此场景
+
+针对于这种场景，一般使用job的方式来完成任务。
+
+**Job负责编排运行有结束时间的“一次性”任务**
+
+-   控制器要确保Pod内的进程“正常（成功完成任务)”退出
+-   **非正常退出的Pod可以根据需要重启，并在重试指定的次数后终止**
+-   Job 可以是单次任务，也可以是在多个Pod分别各自运行一次，实现运行多次（次数通常固定)
+-   Job 支持同时创建及并行运行多个Pod以加快任务处理速度，Job控制器支持用户自定义其并行度
+
+**关于job的执行主要有两种并行度的类型：**
+
+-   **串行 job**：即所有的job任务都在上一个job执行完毕后，再开始执行
+-   **并行 job**：如果存在多个 job，可以设定并行执行的 job 数量。
+
+Job资源同样需要标签选择器和Pod模板，但它不需要指定replicas，且需要给定**completions**，即需要完成的作业次数，默认为1次
+
+-   Job资源会为其Pod对象自动添加“job-name=JOB_NAME”和“controller-uid=UID”标签，并使用标 签选择器完成对controller-uid标签的关联，因此，selector并非必选字段
+-   Pod的命名格式：$(job-name)-$(index)-$(random-string)，其中的$(index)字段取值与 completions和completionMode有关
+
+**注意**：
+
+-   Job 资源是标准的API资源类型
+-   Job 资源所在群组为“batch/v1”
+-   Job 资源中，Pod的RestartPolicy的取值只能为**Never**或**OnFailure**
+
+## job属性解析
+
+```yaml
+apiVersion: batch/v1                   # API群组及版本
+kind: Job
+metadata:
+  name: <string>             
+  namespace: <string>                  # 名称空间：Job资源隶属名称空间级别
+spec:
+  selector: <object>                   # 标签选择器，必须匹配template字段中Pod模版中的标签
+  suspend: <boolean>                   # 是否挂起当前Job的执行，挂起作业会重置StartTime字段的值
+  template: <object>                   # Pod模版对象
+  completions: <integer>               # 期望的成功完成的作业次数，成功运行结束的Pod数量，默认1次
+  completionMode: <string>             # 追踪Pod完成模式，支持有序的Indexed和无序的NonIndexed（默认）两种
+  ttlSecondsAfterFinished: <integer>   # Completed终止状态作业的生存时长，超时将被删除
+  parallelism: <integer>               # 作业的最大并行度，默认为1
+  backoffLimit: <integer>              # 将作业标记为Failed之前的重试次数，默认为6
+  activeDeadlineSeconds: <integer>     # 作业启动后可处于活动状态的时长
+```
+
+**并行配置示例**
+
+```yaml
+#串行运行共5次任务
+spec
+  parallelism: 1
+  completion: 5
+ 
+#并行2个队列，总共运行6次任务
+spec
+  parallelism: 2
+  completion: 6
+```
+
+## Job案例
+
+### 单个任务
+
+```yaml
+cat controller-job-single.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-single
+spec:
+  template:
+    metadata:
+      name: job-single
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: job-single
+        image: busybox:1.30.0
+        command: ["/bin/sh", "-c", "for i in `seq 10 -1 1`; do echo $i; sleep 2; done"]
+        
+kubectl logs job-single-t58q9 -f --timestamps=true
+2024-12-23T03:08:42.128553849Z 10
+2024-12-23T03:08:44.131895308Z 9
+2024-12-23T03:08:46.132162071Z 8
+2024-12-23T03:08:48.132344330Z 7
+2024-12-23T03:08:50.132757393Z 6
+2024-12-23T03:08:52.133286967Z 5
+2024-12-23T03:08:54.133431930Z 4
+2024-12-23T03:08:56.134113681Z 3
+2024-12-23T03:08:58.134510385Z 2
+2024-12-23T03:09:00.134875367Z 1
+
+kubectl get job
+
+kubectl get pod
+NAME                                                   READY   STATUS      RESTARTS       AGE
+job-single-t58q9                                       0/1     Completed   0              13m
+```
+
+### 多个串行任务
+
+```yaml
+# cat controller-job-multi-serial.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-multi-serial
+spec:
+  completions: 5
+  parallelism: 1              # parallelism为1表示串行
+  completionMode: Indexed
+  template:
+    spec:
+      containers:
+      - name: job-multi-serial
+        image: busybox:1.30.0
+        command: ["/bin/sh", "-c", "echo serial job; sleep 3"]
+      restartPolicy: OnFailure
+```
+
+### 并行任务
+
+```yaml
+# cat controller-job-multi-parallel.yaml 
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-multi-parallel
+spec:
+  completions: 6
+  parallelism: 2   # completions/parallelism 如果不能整除,最后一次为剩余的任务数
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 3
+  activeDeadlineSeconds: 1200
+  completionMode: Indexed
+  template:
+    spec:
+      containers:
+      - name: job-multi-parallel
+        image: busybox:1.30.0
+        command: ["/bin/sh", "-c", "echo parallel job; sleep 3"]
+      restartPolicy: OnFailure
+```
+
+# CronJob
+
+![image-20250326202842344](pic/image-20250326202842344.png)
+
+## CronJob工作机制
+
+对于**周期性的定时任务**，kubernetes提供了 Cronjob控制器实现任务的编排
+
+CronJob 建立在Job的功能之上，是更高层级的控制器
+
+它以Job控制器完成单批次的任务编排，而后为这种Job作业提供需要运行的周期定义
+
+CronJob其实就是在Job的基础上加上了时间调度，可以在给定的时间点启动一个Pod 来运行任务，也可 以周期性地在给定时间点启动Pod运行任务。
+
+CronJob 被调用的时间是来自于controller-manager的时间,需要确保controller-manager准确
+
+另外CronJob执行时,需要拉取镜像也需要一定的时间,所以可能会导致真正执行的时间不准确 对于没有指定时区的 CronJob，kube-controller-manager 基于本地时区解释排期表（Schedule）
+
+**删除CronJob，同时会级联删除相关的Job和Pod**
+
+一个CronJob对象其实就对应中crontab文件中的一行，它根据配置的时间格式周期性地运行一个Job， 格式和crontab也是相同的
+
+## Cron 时间表语法
+
+注意：在CronJob中，通配符“?”和“*”的意义相同，它们都表示任何可用的有效值
+
+```shell
+# ┌───────────── 分钟 (0 - 59)
+# │ ┌───────────── 小时 (0 - 23)
+# │ │ ┌───────────── 月的某天 (1 - 31)
+# │ │ │ ┌───────────── 月份 (1 - 12)
+# │ │ │ │ ┌───────────── 周的某天 (0 - 6)（周日到周一；在某些系统上，7 也是星期日）
+# │ │ │ │ │                         或者是 sun，mon，tue，web，thu，fri，sat
+# │ │ │ │ │
+# │ │ │ │ │
+# * * * * *
+```
+
+| 输入                   | 描述                         | 相当于    |
+| ---------------------- | ---------------------------- | --------- |
+| @yearly (or @annually) | 每年 1 月 1 日的午夜运行一次 | 0 0 1 1 * |
+| @monthly               | 每月第一天的午夜运行一次     | 0 0 1 * * |
+| @weekly                | 每周的周日午夜运行一次       | 0 0 * * 0 |
+| @daily (or @midnight)  | 每天午夜运行一次             | 0 0 * * * |
+| @hourly                | 每小时的开始一次             | 0 * * * * |
+
+## CronJob属性解析
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: <string>
+  namespace: <string>
+spec:
+  jobTemplate: <object>
+    metadata: <object>
+    spec: <object>
+  schedule: <string>                   # 调度时间设定，必选字段，格式和Linux的cronjob相同
+  concurrencyPolicy: <string>          # 多个Cronjob是否运行并发策略，官方示例可用值有Allow,Forbid和Replace
+                                       # Allow 允许上一个CronJob没有完成，开始新的一个CronJob开始执行
+                                       # Forbid 禁止在上一个CronJob还没完成，就开始新的任务
+                                       # Replace 当上一个CronJob没有完成时，杀掉旧任务，用新的任务代替
+  failedJobsHistoryLimit: <integer>    # 失败作业的历史记录数，默认为1，建议设置此值稍大一些，方便查看原因
+  successfulDeadlineSeconds: <integer> # 成功作业的历史记录数，默认为3
+  startingDeadlineSeconds: <integer>   # 因错过时间点而未执行的作业的可超期时长，仍可继续执行
+  suspend: <boolean>                   # 是否挂起后续的作业，不影响当前的作业，默认为false
+```
+
+**官方示例**
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hello
+spec:
+  schedule: "* * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: hello
+            image: busybox:1.28
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - date; echo Hello from the kubernetes cluster
+          restartPolicy: OnFailure
+```
+
+## CronJob案例
+
+### 单周期任务
+
+```yaml
+# cat controller-cronjob-simple.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cronjob
+spec:
+  schedule: "*/2 * * * *"   # 每2分钟执行1次
+  jobTemplate:
+    spec:
+      #parallelism: 2       # 两路并行
+      #completions: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: cronjob
+            image: busybox:1.30.0
+            command: ["/bin/sh", "-c", "echo Cron Job"]
+            
+kubectl get cronjobs.batch 
+kubectl get job
+```
+
