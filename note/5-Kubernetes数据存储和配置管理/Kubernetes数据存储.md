@@ -1714,3 +1714,240 @@ kubectl patch storageclass <your-class-name> -p '{"metadata":{"annotations":{"st
 
 # CNS 的存储方案 OpenEBS
 
+## CNS Container Native Storage
+
+![image-20250331113548192](pic/image-20250331113548192.png)
+
+容器原生存储 CNS (Container Attached Storage，早期称为Container Attached Storage CAS) 则是将存储系统自身部署为Kubermetes集群上的一种较新的存储解决方案
+
+*   存储系统自身(包括存储控制器)在Kubernetes上以容器化微服务的方式运行
+*   使得工作负载更易于移植，且更容易根据应用程序的需求改动使用的存储
+*   通常基于工作负载或者按集群部署，因此消除了共享存储的跨工作负载甚至是跨集群的爆炸半径
+*   存储在CAS中的数据可以直接从集群内的容器访问，从而能显著减少读/写时间
+
+基于CNS的存储解决方案，通常包含两类组件
+
+*   控制平面
+    *   负责配置卷以及其他同存储相关任务
+    *   由存储控制器、存储策略以及如何配置数据平面的指令组成
+*   数据平面
+    *   接收并执行来自控制平面的有关如何保存和访问容器信息的指令
+    *   实现池化存储的存储引擎是数据平面的主要组件
+    *   存储引擎本质上负责输入/输出卷路径
+
+## OpenEBS
+
+[OpenEBS - Kubernetes Storage Simplified.](https://openebs.io/)
+
+OpenEBS是CNS存储机制的著名实现之一，由CNCF孵化
+
+OpenEBS 将 Kubernetes 工作线程节点可用的任何存储转换为本地或复制的 Kubernetes 持久卷。
+
+OpenEBS 可帮助应用程序和平台团队轻松部署需要快速、高度持久、可靠且可扩展的容器原生存储的Kubernetes 有状态工作负载。
+
+OpenEBS 也是基于 NVMe 的存储部署的首选。
+
+OpenEBS 最初由 MayaData 构建并捐赠给云原生计算基金会，现在是 CNCF 沙盒项目。
+
+**OpenEBS 是做什么的**
+
+OpenEBS 管理每个 Kubernetes 节点上的可用存储，并使用该存储为有状态工作负载提供本地或复制的持久卷。
+
+![image-20250330103916823](pic/image-20250330103916823.png)
+
+对于本地卷：
+
+*   OpenEBS 可以在 Hostpaths 上创建持久卷或使用子目录，或者使用本地附加的存储或稀疏文件，或者在现有的 LVM 或 ZFS 上。
+*   本地卷直接挂载到 Stateful Pod 中，不会增加数据路径中 OpenEBS 的任何开销，从而减少延迟。
+*   OpenEBS 为本地卷提供了额外的工具，用于监控、备份/恢复、灾难恢复、由 LVM 或 ZFS 堆栈支持的快照、基于容量的计划等。
+
+对于复制卷：
+
+*   OpenEBS 复制存储为每个持久卷创建一个可通过 TCP 访问的 NVMe 目标。
+*   有状态 Pod 将数据写入 NVMe-TCP 目标，该目标将数据同步复制到集群中的多个节点。
+*   OpenEBS 引擎本身部署为 pod，并由 Kubernetes 编排。
+*   当运行有状态 Pod 的节点发生故障时，该 Pod 将被重新调度到集群中的另一个节点，OpenEBS 使用其他节点上的可用数据副本提供对数据的访问。
+*   OpenEBS Replicated Storage 的设计目标是以持久性和性能为目标。它可以有效地管理计算（大页面和内核）和存储（NVMe 驱动器），以提供快速块存储。
+
+## OpenEBS 安装和使用
+
+-   在各节点上部署 **iSCSI client**
+-   在Kubernetes集群上部署OpenEBS
+-   选择要使用的数据引擎
+-   为选择的数据引擎准备StorageClass
+
+### helm安装
+
+[OpenEBS Installation | OpenEBS Docs](https://openebs.io/docs/quickstart-guide/installation#installation-via-helm)
+
+Installation via Helm
+
+安装helm
+
+```shell
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 get_helm.sh
+./get_helm.sh
+```
+
+安装
+
+```shell
+helm repo add openebs https://openebs.github.io/openebs
+helm repo update
+
+helm install openebs --namespace openebs openebs/openebs --create-namespace
+
+helm ls -n openebs
+kubectl get pods -n openebs
+kubectl get all -n openebs 
+kubectl get sc
+```
+
+node节点上要有nvme_tcp内核模块
+
+```shell
+sudo modprobe nvme_tcp
+
+# 持久化
+echo "nvme_tcp" | sudo tee -a /etc/modules-load.d/nvme_tcp.conf
+```
+
+### yaml清单安装
+
+```shell
+wget https://openebs.github.io/charts/openebs-operator.yaml
+
+kubectl apply -f openebs-operator.yaml 
+
+# 注意openebs-hostpath只支持单路读写，即ReadWriteOnce，不支持多路读写
+# 支持多路读写的解决方案
+wget https://openebs.github.io/charts/nfs-operator.yaml
+
+kubectl apply -f nfs-operator.yaml
+
+kubectl get sc openebs-rwx 
+NAME          PROVISIONER         RECLAIMPOLICY   VOLUMEBINDINGMODE   ALLOWVOLUMEEXPANSION   AGE
+openebs-rwx   openebs.io/nfsrwx   Delete          Immediate           false                  50s
+```
+
+### 使用
+
+#### local-hostpath单路读写
+
+```yaml
+vim openebs.yaml
+
+---
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: openebs-local-hostpath-pvc
+spec:
+  storageClassName: openebs-hostpath
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1G
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redis-with-openebs-local-hostpath
+spec:
+  containers:
+  - name: redis
+    image: harbor.l00n9.icu/public/redis:8.0-alpine
+    ports:
+    - containerPort: 6379
+      name: redis
+    volumeMounts:
+    - mountPath: /data
+      name: local-storage
+  volumes:
+  - name: local-storage
+    persistentVolumeClaim:
+      claimName: openebs-local-hostpath-pvc
+```
+
+数据目录
+
+```shell
+# pod所在节点的/var/openebs/local
+ls /var/openebs/local/pvc-17d547a4-4450-4d6c-9fd7-2e4e23b7423a/dump.rdb 
+/var/openebs/local/pvc-17d547a4-4450-4d6c-9fd7-2e4e23b7423a/dump.rdb
+```
+
+#### nfs 多路读写
+
+```yaml
+vim openebs-nfs-rwm.yaml 
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: "openebs-rwx"
+  resources:
+    requests:
+      storage: 1Gi
+      
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redis-with-openebs-nfs-rwm
+spec:
+  containers:
+  - name: redis
+    image: harbor.l00n9.icu/public/redis:8.0-alpine
+    ports:
+    - containerPort: 6379
+      name: redis
+    volumeMounts:
+    - mountPath: /data
+      name: nfs-rwm
+  volumes:
+  - name: nfs-rwm
+    persistentVolumeClaim:
+      claimName: nfs-pvc
+```
+
+```shell
+ls /var/openebs/local/
+```
+
+### 持久化
+
+OpenEBS 是有持久化的能力，但默认并不会帮你保留数据卷本身的生命周期，除非你主动设置！
+
+✅ 方法 1：在 StorageClass 中设置保留策略
+
+编辑 `StorageClass`，把 `persistentVolumeReclaimPolicy` 改成 `Retain`。
+
+```shell
+kubectl edit sc openebs-rwx
+```
+
+添加或修改以下字段：
+
+```yaml
+reclaimPolicy: Retain
+```
+
+这样：
+
+-   删除 PVC 后，PV 不会自动删除
+-   数据目录保留在 node 上
+-   你可以手动再绑定到新的 PVC 上进行恢复
+
+✅ 方法 2：先不删 PVC，只删 Pod
+
+你只删 Pod 是没问题的，PVC 和后端数据依然存在。
+ 等你再用同名 PVC 创建新 Pod，数据还会挂载回来。
