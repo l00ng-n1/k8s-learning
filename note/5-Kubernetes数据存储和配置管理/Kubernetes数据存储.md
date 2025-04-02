@@ -1426,14 +1426,14 @@ spec:
         - name: PROVISIONER_NAME
           value: k8s-sigs.io/nfs-subdir-external-provisioner # 名称确保与nfs-StorageClass.yaml文件中的provisioner名称保持一致
         - name: NFS_SERVER
-          value: nfs.mystical.org
+          value: nfs.l00n9.icu # 修改
         - name: NFS_PATH
-          value: /nfs-data/sc-nfs
+          value: /nfs-data/sc-nfs # 修改
       volumes:
       - name: nfs-client-root
         nfs:
-          server: nfs.mystical.org
-          path: /nfs-data/sc-nfs
+          server: nfs.l00n9.icu # 修改
+          path: /nfs-data/sc-nfs # 修改
 ```
 
 #### **创建NFS资源的storageClass**
